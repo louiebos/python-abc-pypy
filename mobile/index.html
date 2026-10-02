@@ -274,6 +274,10 @@ pre,.section>table,.grid2>div,table.bigt{-webkit-overflow-scrolling:touch}
   .seg button{min-height:40px;min-width:40px}
   .cp{min-height:32px;min-width:48px;opacity:.92}
   pre{font-size:12px;line-height:1.6;overscroll-behavior-x:contain}
+  /* iPhone: keep code readable without long horizontal runs.
+     Real source text is unchanged; only the visual presentation wraps. */
+  .codewrap pre{overflow-x:hidden;tab-size:2}
+  .codewrap pre .ln{white-space:pre-wrap;overflow-wrap:anywhere;word-break:normal}
   table.bigt,.section>table{overscroll-behavior-x:contain}
   .vctl button{min-height:44px}
 }
@@ -4275,14 +4279,87 @@ function visibleCards(){
 // ¶ at line start = reference tier (보기만 하면 되는 것). 📌 자주 쓰는 것만 체크 시 숨김
 function codeLines(code){
   let lines = code.split('\n').map(l => ({ref: l.startsWith('¶'), text: l.replace(/^¶/, '')}));
-  if (!state.core) return lines;
-  lines = lines.filter(l => !l.ref);
-  const isBlank = l => !l || !l.text.trim();
-  const isHead = (arr, i) => /^\s*#/.test(arr[i].text) && (i === 0 || isBlank(arr[i - 1]));
-  let out = [];
-  for (const l of lines) if (!(isBlank(l) && (!out.length || isBlank(out[out.length - 1])))) out.push(l);
-  out = out.filter((l, i, arr) => !(isHead(arr, i) && isBlank(arr[i + 1])));
-  while (out.length && isBlank(out[out.length - 1])) out.pop();
+  if (state.core){
+    lines = lines.filter(l => !l.ref);
+    const isBlank = l => !l || !l.text.trim();
+    const isHead = (arr, i) => /^\s*#/.test(arr[i].text) && (i === 0 || isBlank(arr[i - 1]));
+    let out = [];
+    for (const l of lines) if (!(isBlank(l) && (!out.length || isBlank(out[out.length - 1])))) out.push(l);
+    out = out.filter((l, i, arr) => !(isHead(arr, i) && isBlank(arr[i + 1])));
+    while (out.length && isBlank(out[out.length - 1])) out.pop();
+    lines = out;
+  }
+  return mobileFriendlyCodeLines(lines);
+}
+
+// Find a Python comment marker that is not inside a quoted string.
+function pythonCommentIndex(line){
+  let quote = null, triple = false, escNext = false;
+  for (let i = 0; i < line.length; i++){
+    const ch = line[i];
+    if (escNext){ escNext = false; continue; }
+    if (ch === '\\' && quote){ escNext = true; continue; }
+    if (quote){
+      if (triple){
+        if (line.slice(i, i + 3) === quote.repeat(3)){ i += 2; quote = null; triple = false; }
+      } else if (ch === quote){ quote = null; }
+      continue;
+    }
+    if (ch === '"' || ch === "'"){
+      if (line.slice(i, i + 3) === ch.repeat(3)){ quote = ch; triple = true; i += 2; }
+      else quote = ch;
+      continue;
+    }
+    if (ch === '#') return i;
+  }
+  return -1;
+}
+function visualCols(s){
+  let n = 0;
+  for (const ch of s) n += /[^\u0000-\u00ff]/.test(ch) ? 2 : 1;
+  return n;
+}
+function wrapComment(comment, indent, maxCols=48){
+  const prefix = indent + '# ';
+  const maxText = Math.max(18, maxCols - visualCols(prefix));
+  const words = comment.trim().replace(/^#\s*/, '').split(/\s+/).filter(Boolean);
+  if (!words.length) return [indent + '#'];
+  const out = []; let cur = '';
+  for (const word of words){
+    const candidate = cur ? cur + ' ' + word : word;
+    if (cur && visualCols(candidate) > maxText){ out.push(prefix + cur); cur = word; }
+    else cur = candidate;
+  }
+  if (cur) out.push(prefix + cur);
+  return out;
+}
+function mobileFriendlyCodeLines(lines){
+  if (!window.matchMedia('(max-width: 700px)').matches) return lines;
+  const MAX = 48;
+  const out = [];
+  for (const line of lines){
+    const text = line.text;
+    const idx = pythonCommentIndex(text);
+    const leading = (text.match(/^\s*/) || [''])[0];
+    // Keep full-line section comments where they are; wrap only their text if needed.
+    if (idx === leading.length && text.slice(idx).startsWith('#')){
+      if (visualCols(text) > MAX){
+        wrapComment(text.slice(idx), leading, MAX).forEach(t => out.push({ref: line.ref, text:t}));
+      } else out.push(line);
+      continue;
+    }
+    if (idx > -1){
+      const code = text.slice(0, idx).replace(/\s+$/, '');
+      const comment = text.slice(idx);
+      // Long inline comments (especially examples/results) become their own next line.
+      if (visualCols(text) > MAX || visualCols(comment) > 18){
+        if (code) out.push({ref: line.ref, text:code});
+        wrapComment(comment, leading, MAX).forEach(t => out.push({ref: line.ref, text:t}));
+        continue;
+      }
+    }
+    out.push(line);
+  }
   return out;
 }
 function codeHTML(code){
@@ -4693,15 +4770,65 @@ async function copyTextSafe(text){
   return ok;
 }
 
+/* ============================ VIEW / SCROLL MEMORY ============================ */
+const VIEW_KEY = 'pycs-mobile-view-v1';
+let restoringView = false;
+let scrollSaveTimer = null;
+function readView(){
+  try { return JSON.parse(storeGet(VIEW_KEY, '{}') || '{}'); }
+  catch (_) { return {}; }
+}
+function currentSheetAnchor(){
+  const headerY = ($('header')?.offsetHeight || 0) + 12;
+  let best = null;
+  document.querySelectorAll('#cards .card').forEach(el => {
+    const top = el.getBoundingClientRect().top;
+    if (top <= headerY) best = el;
+  });
+  if (!best) best = document.querySelector('#cards .card');
+  return best ? {id: best.id.replace(/^c-/, ''), offset: Math.round(best.getBoundingClientRect().top - headerY)} : null;
+}
+function saveViewNow(){
+  if (restoringView) return;
+  const view = readView();
+  view.tab = state.tab;
+  view.scroll = view.scroll || {};
+  view.scroll[state.tab] = Math.round(window.scrollY);
+  if (state.tab === 'sheet') view.sheetAnchor = currentSheetAnchor();
+  storeSet(VIEW_KEY, JSON.stringify(view));
+}
+function queueSaveView(){
+  clearTimeout(scrollSaveTimer);
+  scrollSaveTimer = setTimeout(saveViewNow, 120);
+}
+function restoreView(tab){
+  const view = readView();
+  restoringView = true;
+  requestAnimationFrame(() => requestAnimationFrame(() => {
+    let y = view.scroll?.[tab] || 0;
+    if (tab === 'sheet' && view.sheetAnchor?.id){
+      const el = $('#c-' + view.sheetAnchor.id);
+      if (el){
+        const headerY = ($('header')?.offsetHeight || 0) + 12;
+        y = el.getBoundingClientRect().top + window.scrollY - headerY - (view.sheetAnchor.offset || 0);
+      }
+    }
+    window.scrollTo(0, Math.max(0, y));
+    restoringView = false;
+  }));
+}
+if ('scrollRestoration' in history) history.scrollRestoration = 'manual';
+
 /* ============================ EVENTS ============================ */
 function saveKnow(){ storeSet('pycs-mobile-know', JSON.stringify(state.know)); }
-function setTab(t){
+function setTab(t, restore=false){
+  if (state.tab && state.tab !== t) saveViewNow();
   state.tab = t;
   document.querySelectorAll('#tabs button').forEach(b => b.classList.toggle('on', b.dataset.tab === t));
   ['sheet','bigo','viz','quiz'].forEach(x => $('#tab-' + x).classList.toggle('hidden', x !== t));
   if (t === 'viz' && !state.viz.steps.length) buildViz();
   document.querySelectorAll('#ctlRow .ctl').forEach(el => el.classList.toggle('hidden', !el.dataset.for.split(' ').includes(t)));
-  window.scrollTo(0, 0);
+  if (restore) restoreView(t); else window.scrollTo(0, 0);
 }
 function syncControls(){
   $('#q').value = state.q;
@@ -4731,7 +4858,8 @@ $('#weakToggle').onchange = e => { state.weak = e.target.checked; updateAll(); }
 $('#filterBtn').onclick = () => { const open = $('#ctlRow').classList.toggle('open'); $('#filterBtn').setAttribute('aria-expanded', open); };
 $('#jump').onchange = e => { const id = e.target.value; if (!id) return; state.collapsed.delete(id); renderSheet(); const el = $('#c-' + id); window.scrollTo({top: el.getBoundingClientRect().top + window.scrollY - $('header').offsetHeight - 8}); e.target.value = ''; };
 $('#toTop').onclick = () => window.scrollTo({top: 0, behavior: 'smooth'});
-window.addEventListener('scroll', () => $('#toTop').classList.toggle('show', window.scrollY > 600), {passive: true});
+window.addEventListener('scroll', () => { $('#toTop').classList.toggle('show', window.scrollY > 600); queueSaveView(); }, {passive: true});
+window.addEventListener('pagehide', saveViewNow);
 $('#collapseAll').onclick = () => { visibleCards().forEach(c => state.collapsed.add(c.id)); renderSheet(); };
 $('#expandAll').onclick = () => { state.collapsed.clear(); renderSheet(); };
 
@@ -4745,7 +4873,7 @@ $('#themeBtn').onclick = () => {
 };
 $('#resetBtn').onclick = () => {
   if (!confirm('앎/애매/모름 표시, 퀴즈 기록, 필터, 시각화 입력, 테마를 전부 처음 상태로 되돌릴까요?')) return;
-  storeRemove('pycs-mobile-know'); storeRemove('pycs-mobile-theme');
+  storeRemove('pycs-mobile-know'); storeRemove('pycs-mobile-theme'); storeRemove(VIEW_KEY);
   if (state.viz.timer) togglePlay();
   Object.assign(state, DEFAULTS, {know:{}}); state.collapsed.clear();
   Object.entries(VIZ_DEFAULT_INPUTS).forEach(([k, inp]) => VIZ[k].inputs = {...inp});
@@ -4811,9 +4939,12 @@ $('#qnext').onclick = nextQ;
 Object.keys(VIZ).forEach(k => VIZ_DEFAULT_INPUTS[k] = {...VIZ[k].inputs});
 window.matchMedia('(max-width: 700px)').addEventListener('change', () => renderDS());
 applyTheme(storeGet('pycs-mobile-theme', 'dark') || 'dark');
-setTab('sheet');
+const savedView = readView();
+const initialTab = ['sheet','bigo','viz','quiz'].includes(savedView.tab) ? savedView.tab : 'sheet';
+setTab(initialTab);
 initConcepts();
 renderBigO(); renderDS(); shuffleQuiz(); updateAll();
+restoreView(initialTab);
 </script>
 </body>
 </html>
